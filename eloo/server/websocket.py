@@ -36,7 +36,7 @@ class ClientMessageHandler:
         """Handle incoming messages from WebSocket."""
         logger.debug(f'Handling message: action={action}, data={data}')
         try:
-            if action == 'promt':
+            if action == 'prompt':
                 await self.run_prompt(data.get('prompt', ''))
             elif action == 'get_session_state':
                 await self.send_session_state()
@@ -143,31 +143,26 @@ class WebSocketServer:
         await self._send_response(client_id, 'status_update', data['data'])
 
     async def initialize(self, cleanup_callback: Callable[[], None]):
-        """Start the server."""
+        """Initialize the server without blocking."""
         self._cleanup_callback = cleanup_callback
+        logger.info(f'Starting server on {config.host}:{config.port}')
 
-        try:
-            logger.info(f'Starting server on {config.host}:{config.port}')
-            uvicorn_config = uvicorn.Config(
-                self._app, host=config.host, port=config.port
-            )
-            uvicorn_server = uvicorn.Server(uvicorn_config)
+        # Configure uvicorn
+        uvicorn_config = uvicorn.Config(
+            self._app, host=config.host, port=config.port, loop='asyncio'
+        )
+        self._server = uvicorn.Server(uvicorn_config)
 
-            # Handle graceful shutdown
-            loop = asyncio.get_event_loop()
-            for sig in (signal.SIGTERM, signal.SIGINT):
-                loop.add_signal_handler(
-                    sig, lambda: asyncio.create_task(self.cleanup())
-                )
+        # Handle graceful shutdown
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(self.cleanup()))
 
-            await uvicorn_server.serve()
-        except asyncio.CancelledError:
-            logger.info('Server shutdown initiated')
-            await self.cleanup_callback()
-        except Exception as e:
-            logger.error(f'Server error: {e}')
-            await self.cleanup_callback()
-            raise
+        # Start server in background task
+        self._serve_task = asyncio.create_task(self._server.serve())
+
+        # Wait a moment for server to start
+        await asyncio.sleep(0.5)
 
     async def _disconnect(self, client_id: str):
         """Clean up client connection."""

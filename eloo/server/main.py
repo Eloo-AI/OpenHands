@@ -21,15 +21,15 @@ class ApplicationServer:
 
         self._code_agent = CodeAgent()
 
+        # Start WebSocket server first
         handler = ClientMessageHandler(
             self._code_agent.run_prompt, self._code_agent.send_session_state
         )
         self._websocket = WebSocketServer(handler)
         await self._websocket.initialize(self.cleanup)
-        logger.info('WebSocket Server initialized successfully')
 
+        # Then initialize code agent
         await self._code_agent.initialize(self._websocket.code_agent_listener())
-
         logger.info('Application Server initialized successfully')
 
     async def cleanup(self):
@@ -44,6 +44,12 @@ async def main():
     """Application entry point."""
     server = ApplicationServer()
     await server.initialize()
+    # Keep main task running
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        await server.cleanup()
 
 
 if __name__ == '__main__':
