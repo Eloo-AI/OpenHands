@@ -8,7 +8,7 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from eloo.code_agent import CodeAgentListenerIFC
+from eloo.server.code_agent import CodeAgentListenerIFC
 from eloo.server.config import config
 
 logger = logging.getLogger(__name__)

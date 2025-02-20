@@ -1,7 +1,7 @@
 import asyncio
 import logging
 
-from eloo.code_agent import CodeAgent
+from eloo.server.code_agent import CodeAgent
 from eloo.server.websocket import ClientMessageHandler, WebSocketServer
 
 logger = logging.getLogger(__name__)
