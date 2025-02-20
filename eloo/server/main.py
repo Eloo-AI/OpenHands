@@ -1,64 +1,71 @@
 import asyncio
-import logging
-from typing import Dict, Any
-from eloo.server.config import config
+from typing import Any, Dict
+
 from eloo.code_agent import CodeAgent
-from eloo.server.websocket import WebSocketServer, MessageHandler
-from eloo.server.logger import logger
+from eloo.server.config import config
+from eloo.server.logger import eloo_logger as logger
+from eloo.server.websocket import MessageHandler, WebSocketServer
+
 
 class OpenHandsMessageHandler(MessageHandler):
     """Handles messages by delegating to OpenHands."""
-    
+
     def __init__(self, code_agent: CodeAgent):
         self.code_agent = code_agent
 
     async def handle_message(self, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Handle incoming messages from WebSocket."""
-        if action == "code":
-            state = await self.code_agent.run_prompt(data.get("prompt", ""))
-            return self._extract_response(state)
-        elif action in ["git_fetch", "git_push"]:
-            # TODO: Implement git operations
-            raise NotImplementedError(f"{action} not implemented")
-        else:
-            raise ValueError(f"Unknown action: {action}")
+        logger.debug(f'Handling message: action={action}, data={data}')
+        try:
+            if action == 'code':
+                state = await self.code_agent.run_prompt(data.get('prompt', ''))
+                response = self._extract_response(state)
+                logger.debug(f'Generated response: {response}')
+                return response
+            elif action in ['git_fetch', 'git_push']:
+                # TODO: Implement git operations
+                raise NotImplementedError(f'{action} not implemented')
+            else:
+                raise ValueError(f'Unknown action: {action}')
+        except Exception as e:
+            logger.error(f'Error handling message: {str(e)}')
+            raise
 
     def _extract_response(self, state):
         """Extract formatted response from OpenHands state."""
         return {
-            "messages": [
-                {
-                    "source": event.source.value,
-                    "content": event.content
-                }
+            'messages': [
+                {'source': event.source.value, 'content': event.content}
                 for event in state.history
-                if hasattr(event, "content")
+                if hasattr(event, 'content')
             ]
         }
 
+
 class ApplicationServer:
     """Main application server coordinator."""
-    
+
     def __init__(self):
         self._code_agent: CodeAgent = None
         self._websocket: WebSocketServer = None
 
     async def initialize(self):
         """Initialize server components."""
-        logger.debug("Initializing Application Server...")
-        
+        logger.debug('Initializing Application Server...')
+
         self._code_agent = CodeAgent()
         await self._code_agent.initialize()
-        
+
         handler = OpenHandsMessageHandler(self._code_agent)
         self._websocket = WebSocketServer(handler)
-        
-        logger.info("Application Server initialized successfully")
+
+        logger.info('Application Server initialized successfully')
 
     def run(self):
         """Start the server."""
-        logger.info(f"Starting server on {config.host}:{config.port}")
+        logger.info(f'Starting server on {config.host}:{config.port}')
         self._websocket.run(config.host, config.port)
+
 
 def main():
     """Application entry point."""
@@ -66,5 +73,6 @@ def main():
     asyncio.run(server.initialize())
     server.run()
 
-if __name__ == "__main__":
-    main() 
+
+if __name__ == '__main__':
+    main()
