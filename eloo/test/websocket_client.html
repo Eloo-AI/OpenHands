@@ -24,11 +24,47 @@
         .user { background: #e3f2fd; }
         .assistant { background: #f5f5f5; }
         .error { background: #ffebee; color: #c62828; }
+        #preview-url {
+            margin: 10px 0;
+            padding: 10px;
+            background-color: #e8f5e9;
+            border-radius: 4px;
+            font-family: monospace;
+        }
+        #preview-url a {
+            color: #1976d2;
+            text-decoration: none;
+        }
+        #preview-url a:hover {
+            text-decoration: underline;
+        }
+        .state-info {
+            margin: 10px 0;
+            padding: 10px;
+            background-color: #f5f5f5;
+            border-radius: 4px;
+            font-family: monospace;
+        }
+        .state-info .label {
+            font-weight: bold;
+            color: #666;
+            display: inline-block;
+            width: 150px;
+        }
+        .state-info .value {
+            color: #1976d2;
+        }
     </style>
 </head>
 <body>
     <h2>WebSocket Code Assistant</h2>
     <div id="status">Disconnected</div>
+    <div class="state-info">
+        <div><span class="label">Status:</span> <span id="status-value">Not available</span></div>
+        <div><span class="label">Agent State:</span> <span id="agent-state-value">Not available</span></div>
+        <div><span class="label">Environment:</span> <span id="environment-state-value">Not available</span></div>
+    </div>
+    <div id="preview-url">Preview: <span id="preview-link">Not available</span></div>
     <div id="messages"></div>
     <textarea id="prompt" placeholder="Enter your code prompt here..."></textarea>
     <button onclick="sendMessage()">Send</button>
@@ -37,12 +73,23 @@
         const ws = new WebSocket('ws://localhost:8000/ws/test-client');
         const messagesDiv = document.getElementById('messages');
         const statusDiv = document.getElementById('status');
+        const previewLinkSpan = document.getElementById('preview-link');
+        const statusValueSpan = document.getElementById('status-value');
+        const agentStateValueSpan = document.getElementById('agent-state-value');
+        const environmentStateValueSpan = document.getElementById('environment-state-value');
         const promptInput = document.getElementById('prompt');
 
         ws.onopen = () => {
             statusDiv.textContent = 'Connected';
             statusDiv.style.color = 'green';
             addMessage('System', 'Connected to server');
+
+            // Send get_preview message after connection
+            const message = {
+                action: 'get_session_state',
+                data: {}
+            };
+            ws.send(JSON.stringify(message));
         };
 
         ws.onclose = () => {
@@ -57,16 +104,25 @@
 
         ws.onmessage = (event) => {
             const response = JSON.parse(event.data);
-
-            if (response.action === 'error') {
-                addMessage('Error', response.data.message);
-                return;
-            }
-
-            if (response.action === 'code_response') {
-                response.data.messages.forEach(msg => {
-                    addMessage(msg.source, msg.content);
-                });
+            switch (response.action) {
+                case 'error':
+                    addMessage('Error', response.data.message);
+                    break;
+                case 'message':
+                    addMessage(response.data.source, response.data.content);
+                    break;
+                case 'preview_url_update':
+                    if (response.data.preview_url) {
+                        previewLinkSpan.innerHTML = `<a href="${response.data.preview_url}" target="_blank">${response.data.preview_url}</a>`;
+                    }
+                    break;
+                case 'agent_state_update':
+                    if (response.data.agent_state) {
+                        agentStateValueSpan.textContent = response.data.agent_state;
+                    }
+                    break;
+                default:
+                    console.log('Unknown action:', response.action, response.data);
             }
         };
 
@@ -75,7 +131,7 @@
             if (!prompt) return;
 
             const message = {
-                action: 'code',
+                action: 'prompt',
                 data: { prompt }
             };
 
@@ -84,6 +140,15 @@
             promptInput.value = '';
         }
 
+        // Replace the Ctrl+Enter handler with Enter handler
+        promptInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault(); // Prevent default Enter behavior
+                sendMessage();
+            }
+            // Shift+Enter will still create a new line
+        });
+
         function addMessage(source, content) {
             const messageDiv = document.createElement('div');
             messageDiv.className = `message ${source.toLowerCase()}`;
@@ -91,13 +156,6 @@
             messagesDiv.appendChild(messageDiv);
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
-
-        // Allow sending with Ctrl+Enter
-        promptInput.addEventListener('keydown', (e) => {
-            if (e.ctrlKey && e.key === 'Enter') {
-                sendMessage();
-            }
-        });
     </script>
 </body>
 </html>

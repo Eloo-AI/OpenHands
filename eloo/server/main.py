@@ -1,45 +1,11 @@
 import asyncio
-from typing import Any, Dict
+import logging
 
 from eloo.code_agent import CodeAgent
-from eloo.server.config import config
-from eloo.server.logger import eloo_logger as logger
-from eloo.server.websocket import MessageHandler, WebSocketServer
+from eloo.server.websocket import ClientMessageHandler, WebSocketServer
 
-
-class OpenHandsMessageHandler(MessageHandler):
-    """Handles messages by delegating to OpenHands."""
-
-    def __init__(self, code_agent: CodeAgent):
-        self.code_agent = code_agent
-
-    async def handle_message(self, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle incoming messages from WebSocket."""
-        logger.debug(f'Handling message: action={action}, data={data}')
-        try:
-            if action == 'code':
-                state = await self.code_agent.run_prompt(data.get('prompt', ''))
-                response = self._extract_response(state)
-                logger.debug(f'Generated response: {response}')
-                return response
-            elif action in ['git_fetch', 'git_push']:
-                # TODO: Implement git operations
-                raise NotImplementedError(f'{action} not implemented')
-            else:
-                raise ValueError(f'Unknown action: {action}')
-        except Exception as e:
-            logger.error(f'Error handling message: {str(e)}')
-            raise
-
-    def _extract_response(self, state):
-        """Extract formatted response from OpenHands state."""
-        return {
-            'messages': [
-                {'source': event.source.value, 'content': event.content}
-                for event in state.history
-                if hasattr(event, 'content')
-            ]
-        }
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 class ApplicationServer:
@@ -54,25 +20,31 @@ class ApplicationServer:
         logger.debug('Initializing Application Server...')
 
         self._code_agent = CodeAgent()
-        await self._code_agent.initialize()
 
-        handler = OpenHandsMessageHandler(self._code_agent)
+        handler = ClientMessageHandler(
+            self._code_agent.run_prompt, self._code_agent.send_session_state
+        )
         self._websocket = WebSocketServer(handler)
+        await self._websocket.initialize(self.cleanup)
+        logger.info('WebSocket Server initialized successfully')
+
+        await self._code_agent.initialize(self._websocket.code_agent_listener())
 
         logger.info('Application Server initialized successfully')
 
-    def run(self):
-        """Start the server."""
-        logger.info(f'Starting server on {config.host}:{config.port}')
-        self._websocket.run(config.host, config.port)
+    async def cleanup(self):
+        """Cleanup resources before shutdown"""
+        logger.info('Cleaning up resources...')
+        if self._code_agent:
+            await self._code_agent.close()
+        logger.info('Cleanup complete')
 
 
-def main():
+async def main():
     """Application entry point."""
     server = ApplicationServer()
-    asyncio.run(server.initialize())
-    server.run()
+    await server.initialize()
 
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())

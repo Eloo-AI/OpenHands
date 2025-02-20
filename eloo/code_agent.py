@@ -1,130 +1,233 @@
-import os
-import signal
-from typing import Optional
+import asyncio
+import logging
+from datetime import datetime
+from typing import Any, Dict, Optional, Protocol
 
-from eloo.server.logger import eloo_logger as logger
-from openhands.controller.state.state import State
-from openhands.core.config import AppConfig, SandboxConfig
-from openhands.core.main import create_runtime, run_controller
-from openhands.events.action import MessageAction
-from openhands.events.stream import EventStream
-from openhands.runtime.base import Runtime
+import aiohttp
+from socketio import AsyncClient
 
-CONTAINER_NAME = 'openhands-test-container'
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 
-def handle_exit(signum, frame):
-    """Handle exit signals without closing the container."""
-    # Prevent runtime from being closed
-    global _runtime
-    if _runtime:
-        _runtime._container = None  # type: ignore
-
-
-# Register signal handlers
-signal.signal(signal.SIGINT, handle_exit)
-signal.signal(signal.SIGTERM, handle_exit)
-
-
-class ExtendedSandboxConfig(SandboxConfig):
-    """Extended sandbox config that allows setting container name."""
-
-    container_name: str | None = None
-
-    class Config:
-        extra = 'allow'  # Allow extra fields to be passed through
+class CodeAgentListenerIFC(Protocol):
+    async def on_message(self, message: str): ...
+    async def on_agent_state_update(self, new_state: str): ...
+    async def on_preview_url_update(self, preview_url: str): ...
+    async def on_error(self, error: str): ...
+    async def on_action_performed(self, action: str): ...
+    async def on_observation_performed(self, observation: str): ...
 
 
 class CodeAgent:
-    """Manages the lifecycle of the OpenHands server and its Docker container."""
+    def __init__(self, base_url=None):
+        self.base_url = base_url or 'http://127.0.0.1:3000'
 
-    def __init__(self):
-        logger.debug('Initializing OpenHands server')
-        self.runtime: Optional[Runtime] = None
-        self.config: Optional[AppConfig] = None
-        self._initialize_config()
+        self.ws_url = self.base_url.replace('http://', 'ws://').replace(
+            'https://', 'wss://'
+        )
+        logger.debug(f'Using base_url={self.base_url}, ws_url={self.ws_url}')
 
-    def _initialize_config(self):
-        """Initialize the default configuration."""
-        root_dir = os.path.dirname(os.path.dirname(__file__))
-        workspace_dir = os.path.join(root_dir, 'workspace')
-        os.makedirs(workspace_dir, exist_ok=True)
+        # Use AsyncClient instead of Client
+        self.sio = AsyncClient(
+            reconnection=True,
+            reconnection_attempts=3,
+            logger=False,
+            engineio_logger=False,
+        )
+        self.conversation_id = None
+        self.agent_state = None
+        self.can_accept_input = False
+        self.session = None
 
-        sandbox_config = SandboxConfig(
-            enable_auto_lint=True,
-            use_host_network=False,
-            timeout=300,
-            platform='linux/amd64',
-            keep_runtime_alive=True,
-            rm_all_containers=False,
+        # Session State
+        self.status = None
+        self.agent_state = None
+        self.environment_state = None
+        self.preview_url = None
+
+        # Set up socket.io event handlers
+        self.sio.on('connect', self.on_connect)
+        self.sio.on('disconnect', self.on_disconnect)
+        self.sio.on('oh_event', self.on_event)
+
+    def initial_message(self):
+        return 'start the web server with the corresponding ports, using `npm run dev`. provide the server url without any other explanations.'
+
+    async def initialize(self, listener: CodeAgentListenerIFC):
+        """Initialize the CodeAgent"""
+        self.listener = listener
+
+        await self.create_conversation(self.initial_message())
+
+        await self.connect_websocket()
+        await self.wait_for_input_ready()
+        logger.info('Agent initialized and ready for input')
+
+    async def create_conversation(self, initial_msg: Optional[str] = None) -> str:
+        """Create a new conversation and return the conversation ID"""
+        if initial_msg is None:
+            initial_msg = 'Wait for next command'
+
+        if self.session is None:
+            self.session = aiohttp.ClientSession()
+
+        response = await self.session.post(
+            f'{self.base_url}/api/conversations',
+            json={
+                'selected_repository': None,
+                'initial_user_msg': initial_msg,
+                'image_urls': None,
+            },
+        )
+        data = await response.json()
+
+        if data['status'] == 'ok':
+            self.conversation_id = data['conversation_id']
+            logger.debug(f'***** API_CONVERSATION_CREATED: {self.conversation_id}')
+            return self.conversation_id
+        raise Exception(f'Failed to create conversation: {data}')
+
+    async def connect_websocket(self):
+        """Connect to the WebSocket server"""
+        if not self.conversation_id:
+            raise Exception('Must create conversation before connecting')
+
+        logger.debug(
+            f'***** WS_CONNECTING to: {self.ws_url} with conversation_id={self.conversation_id}'
         )
 
-        self.config = AppConfig(
-            default_agent='CodeActAgent',
-            run_as_openhands=False,
-            runtime='docker',
-            max_iterations=10,
-            workspace_base=root_dir,
-            workspace_mount_path='/Users/vigdor/GitHub/OpenHands/workspace',
-            sandbox=sandbox_config,
-            debug=False,
-        )
+        connection_url = f'{self.ws_url}/socket.io/?conversation_id={self.conversation_id}&latest_event_id=-1'
 
-    async def initialize(self):
-        logger.debug('Connecting to OpenHands runtime')
-        if self.config is None:
-            raise ValueError('Config must be initialized before starting server')
+        try:
+            await self.sio.connect(
+                connection_url, transports=['websocket'], wait_timeout=10
+            )
+        except Exception as e:
+            logger.error(f'***** WS_ERROR: Connection failed: {str(e)}')
+            logger.error(f'***** WS_ERROR: Connection URL: {connection_url}')
+            raise
 
-        runtime = await get_or_create_runtime(self.config)
-        self.runtime = runtime
-        return self.runtime
+    async def on_connect(self):
+        """Handle socket connection"""
+        logger.info('***** WS_CONNECTED')
+        if self.conversation_id:
+            # Initialize the session
+            await self.sio.emit(
+                'init',
+                {
+                    'action': 'init',
+                    'conversation_id': self.conversation_id,
+                    'latest_event_id': -1,
+                },
+            )
+
+    def on_disconnect(self):
+        """Handle socket disconnection"""
+        logger.info('***** WS_DISCONNECTED')
+
+    async def send_session_state(self):
+        """Send the session state to the server"""
+        await self.listener.on_agent_state_update(self.agent_state)
+        await self.listener.on_preview_url_update(self.preview_url)
+
+    async def on_event(self, data: Dict[str, Any]):
+        """Handle events from the server"""
+
+        # Handle different types of messages
+        if 'status_update' in data:
+            self.status_type = data.get('type', 'info')
+            message = data.get('message', '')
+            logger.debug(f'[Status {self.status_type}] {message}')
+            await self.send_session_state()
+
+        elif 'source' in data:
+            source = data['source']
+            message = data.get('message', '')
+            action = data.get('action', '')
+            observation = data.get('observation', '')
+
+            if source == 'agent':
+                if action == 'message':
+                    logger.info(f'MESSAGE DATA: {data}')
+                    if message.startswith(('http://', 'https://')):
+                        logger.info(f'$$$$$ preview server in {message}')
+                        self.preview_url = message
+                        await self.listener.on_preview_url_update(message)
+                    else:
+                        logger.info(f'Agent: {message}')
+                        await self.listener.on_message(message)
+
+                elif action in ['edit', 'read', 'run']:
+                    pass
+                    # logger.debug(f"\nAgent Action ({action}): {message}")
+                elif observation == 'agent_state_changed':
+                    state = data.get('extras', {}).get('agent_state', 'unknown')
+                    self.agent_state = state
+                    logger.debug(f'Agent State Changed to: {state}')
+                    await self.send_session_state()
+                    # Update input readiness based on state
+                    if state == 'awaiting_user_input':
+                        self.can_accept_input = True
+                    else:
+                        self.can_accept_input = False
+                else:
+                    pass
+                    # logger.debug(f"Agent Other: {message}")
+
+            elif source == 'environment':
+                if observation == 'agent_state_changed':
+                    state = data.get('extras', {}).get('agent_state', 'unknown')
+                    self.agent_state = state
+                    logger.debug(f'Agent State Changed to {state}')
+                    await self.send_session_state()
+                    # Also check environment state changes
+                    if state == 'awaiting_user_input':
+                        self.can_accept_input = True
+                        logger.info('Ready for user input!')
+                        await self.send_session_state()
+                    else:
+                        self.can_accept_input = False
+                else:
+                    pass
+                    # logger.debug(f"\nEnvironment: {message}")
+
+        # logger.debug("=" * 25)
 
     async def run_prompt(self, prompt: str):
-        """Run a prompt using the initialized runtime."""
-        if self.runtime is None:
-            await self.initialize()
+        """Run a prompt through the CodeAgent"""
+        if not prompt or prompt == '':
+            logger.error('Prompt is required')
+            return
 
-        return await run_agent_with_prompt(
-            prompt=prompt, config=self.config, runtime=self.runtime
+        self.can_accept_input = False
+
+        await self._send_message(
+            {
+                'action': 'message',
+                'args': {
+                    'content': prompt,
+                    'image_urls': [],
+                    'timestamp': datetime.now().isoformat(),
+                },
+            }
         )
 
+    async def _send_message(self, message: Dict):
+        """Send a message through the WebSocket"""
+        if not self.conversation_id:
+            raise Exception('Must create conversation before sending messages')
 
-async def get_or_create_runtime(config: AppConfig) -> Runtime:
-    """Get existing runtime or create new one with consistent name."""
-    global _runtime
+        await self.sio.emit('oh_action', message)
 
-    _runtime = create_runtime(config)
-    await _runtime.connect()
+    async def close(self):
+        """Close the WebSocket connection and HTTP session"""
+        if self.sio.connected:
+            await self.sio.disconnect()
+        if self.session is not None:
+            await self.session.close()
 
-    return _runtime
-
-
-async def run_agent_with_prompt(
-    prompt: str,
-    config: Optional[AppConfig] = None,
-    runtime: Optional[Runtime] = None,
-) -> State:
-    try:
-        # Get event stream instance and clear subscribers
-        event_stream = EventStream()
-        event_stream.clear_subscribers()
-
-        # Create the initial message action with our prompt
-        initial_action = MessageAction(content=prompt)
-
-        # Run the controller
-        state = await run_controller(
-            config=config,
-            initial_user_action=initial_action,
-            runtime=runtime,
-            fake_user_response_fn=None,
-            exit_on_message=True,
-        )
-
-        if state is None:
-            raise ValueError('State should not be None.')
-
-        return state
-    finally:
-        # Clean up subscribers after running
-        event_stream.clear_subscribers()
+    async def wait_for_input_ready(self):
+        """Wait until agent is ready for input"""
+        while not self.can_accept_input:
+            await asyncio.sleep(0.1)
